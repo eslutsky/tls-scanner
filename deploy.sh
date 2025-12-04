@@ -148,7 +148,7 @@ EOF
     fi
     
     # Substitute environment variables in the template and apply it
-    sed -e "s|\\${SCANNER_IMAGE}|${SCANNER_IMAGE}|g" -e "s|\\${NAMESPACE}|${NAMESPACE}|g" -e "s|\\${JOB_NAME}|${JOB_NAME}|g" "$JOB_TEMPLATE" | oc apply -f -
+    sed -e "s|\\\${SCANNER_IMAGE}|${SCANNER_IMAGE}|g" -e "s|\\\${NAMESPACE}|${NAMESPACE}|g" -e "s|\\\${JOB_NAME}|${JOB_NAME}|g" "$JOB_TEMPLATE" | oc apply -f -
     check_error "Applying Job manifest"
 
     echo "--> Scanner Job '${JOB_NAME}' deployed."
@@ -210,58 +210,57 @@ EOF
 
     # Wait for the job to complete
     if ! oc wait --for=condition=complete "job/${JOB_NAME}" -n "${NAMESPACE}" --timeout=3h; then
-        echo "Error: Scanner Job did not complete successfully or timed out."
-        # Attempt to get logs and describe the pod for debugging
+        echo "Error: Job '${JOB_NAME}' did not complete within the 3h timeout."
+        echo "--- Final job status ---"
+        oc describe job "${JOB_NAME}" -n "${NAMESPACE}"
+        echo "--- Final pod status ---"
         POD_NAME=$(oc get pods -n "${NAMESPACE}" -l job-name=${JOB_NAME} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
         if [ -n "$POD_NAME" ]; then
-            echo "--- Describing scanner pod for more details ---"
-            oc describe pod "$POD_NAME" -n "${NAMESPACE}"
-            echo "--- End of pod description ---"
-            echo "--- Logs from scanner pod ---"
-            oc logs "$POD_NAME" -n "${NAMESPACE}"
-            echo "--- End of scanner pod logs ---"
-        else
-            echo "Warning: Could not find scanner pod for job ${JOB_NAME}."
+            oc describe pod "${POD_NAME}" -n "${NAMESPACE}"
+            echo "--- Scanner pod logs ---"
+            oc logs "pod/${POD_NAME}" -n "${NAMESPACE}"
         fi
         exit 1
     fi
-    echo "Job completed successfully."
 
-    # Copy artifacts from the completed job
-    echo "Copying artifacts..."
+    echo "--> Job '${JOB_NAME}' completed successfully."
+    
+    echo "--> Copying artifacts from completed pod..."
+    # Find the pod created by the job
     POD_NAME=$(oc get pods -n "${NAMESPACE}" -l job-name=${JOB_NAME} -o jsonpath='{.items[0].metadata.name}')
-    if [ -n "$POD_NAME" ]; then
-        oc cp "${NAMESPACE}/${POD_NAME}:/artifacts/." ./artifacts/
-        check_error "Copying artifacts"
-        echo "Artifacts copied to ./artifacts/"
-    else
-        echo "Warning: Could not find scanner pod to copy artifacts from."
-    fi
+    check_error "Finding completed pod"
+
+    # Create a local directory for artifacts
+    mkdir -p ./artifacts
+
+    # Copy files from the pod
+    oc cp "${NAMESPACE}/${POD_NAME}:/artifacts/results.json" "./artifacts/results.json"
+    check_error "Copying results.json"
+    oc cp "${NAMESPACE}/${POD_NAME}:/artifacts/results.csv" "./artifacts/results.csv"
+    check_error "Copying results.csv"
+    oc cp "${NAMESPACE}/${POD_NAME}:/artifacts/scan.log" "./artifacts/scan.log"
+    check_error "Copying scan.log"
+
+    echo "--> Artifacts copied to ./artifacts directory."
 }
 
 cleanup() {
-    print_header "Step 4: Cleaning Up Resources"
+    print_header "Step 4: Cleaning Up"
     check_command "oc"
 
-    echo "--> Deleting Job '${JOB_NAME}' in namespace '${NAMESPACE}'..."
-    oc delete job "$JOB_NAME" -n "$NAMESPACE" --ignore-not-found=true
-    check_error "Deleting Job"
-
-    echo "--> Removing RBAC permissions..."
+    echo "--> Removing ClusterRoleBinding for 'cluster-reader'..."
     oc adm policy remove-cluster-role-from-user cluster-reader -z default -n "$NAMESPACE" || true
-    oc adm policy remove-scc-from-user privileged -z default -n "$NAMESPACE" || true
+    echo "--> Removing ClusterRoleBinding for 'tls-scanner-cross-namespace'..."
     oc adm policy remove-cluster-role-from-user tls-scanner-cross-namespace -z default -n "$NAMESPACE" || true
-    oc delete clusterrole tls-scanner-cross-namespace --ignore-not-found=true || true
-    check_error "Removing RBAC permissions"
-
-    echo "--> Deleting pull secret link..."
-    oc secrets unlink default pull-secret -n "$NAMESPACE" || true
-    check_error "Deleting pull secret link"
-
-    echo "--> Deleting pull secret..."
+    echo "--> Removing SCC 'privileged' from ServiceAccount..."
+    oc adm policy remove-scc-from-user privileged -z default -n "$NAMESPACE" || true
+    echo "--> Deleting ClusterRole 'tls-scanner-cross-namespace'..."
+    oc delete clusterrole tls-scanner-cross-namespace --ignore-not-found=true
+    echo "--> Deleting Job '${JOB_NAME}'..."
+    oc delete job "$JOB_NAME" -n "$NAMESPACE" --ignore-not-found=true
+    echo "--> Deleting copied pull secret..."
     oc delete secret pull-secret -n "$NAMESPACE" --ignore-not-found=true
-    check_error "Deleting pull secret"
-
+    
     echo "--> Cleanup complete."
 }
 

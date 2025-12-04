@@ -778,8 +778,16 @@ func scanIP(k8sClient *K8sClient, ip string, pod PodInfo, tlsSecurityProfile *TL
 	// Correlate results with discovered ports
 	for _, port := range openPorts {
 		if portResult, ok := resultsByPort[strconv.Itoa(port)]; ok {
+			// Log port state for debugging
+			if portResult.State == "filtered" {
+				log.Printf("Port %d on %s is filtered (not accessible). This may be due to firewall rules, network policies, or the service not listening on this IP. TLS information will be N/A.", port, ip)
+			} else if portResult.State != "open" {
+				log.Printf("Port %d on %s has state '%s'. TLS information may be unavailable.", port, ip, portResult.State)
+			}
+
 			// Check compliance and get process info if TLS data was found
 			if len(portResult.TlsCiphers) > 0 {
+				log.Printf("Found TLS information for port %d on %s: %d ciphers, versions: %v", port, ip, len(portResult.TlsCiphers), portResult.TlsVersions)
 				checkCompliance(&portResult, tlsSecurityProfile)
 
 				if k8sClient != nil && len(pod.Containers) > 0 {
@@ -788,13 +796,17 @@ func scanIP(k8sClient *K8sClient, ip string, pod PodInfo, tlsSecurityProfile *TL
 					if processName, ok := k8sClient.processNameMap[ip][port]; ok {
 						portResult.ProcessName = processName
 						portResult.ContainerName = strings.Join(pod.Containers, ",")
+						log.Printf("Identified process for port %d on %s: %s", port, ip, processName)
 					}
 					k8sClient.processCacheMutex.Unlock()
 				}
+			} else {
+				log.Printf("No TLS information found for port %d on %s (state: %s). This port may not be listening, may be blocked by network policies, or may not be a TLS service.", port, ip, portResult.State)
 			}
 			ipResult.PortResults = append(ipResult.PortResults, portResult)
 		} else {
 			// Port was discovered but not in the ssl-enum-ciphers result (e.g., not an SSL port)
+			log.Printf("Port %d on %s was declared in pod spec but not found in nmap results. Assuming non-TLS service.", port, ip)
 			ipResult.PortResults = append(ipResult.PortResults, PortResult{Port: port, State: "open"})
 		}
 	}

@@ -21,6 +21,8 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/remotecommand"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 func newK8sClient() (*K8sClient, error) {
@@ -35,6 +37,7 @@ func newK8sClient() (*K8sClient, error) {
 		if err != nil {
 			return nil, fmt.Errorf("could not get kubernetes config: %v", err)
 		}
+		log.Println("Successfully created Kubernetes client from kubeconfig file")
 	}
 
 	clientset, err := kubernetes.NewForConfig(config)
@@ -509,50 +512,130 @@ func (k *K8sClient) getKubeletTLS() (*KubeletTLSProfile, error) {
 }
 
 func (k *K8sClient) getAllPodsInfo() []PodInfo {
-	pods, err := k.clientset.CoreV1().Pods("").List(context.Background(), metav1.ListOptions{}) // TODO handle error
+	log.Println("Getting all pods from the cluster...")
+	pods, err := k.clientset.CoreV1().Pods("").List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
-		log.Printf("Error getting pods for info: %v", err)
+		log.Printf("Warning: Could not list pods: %v", err)
 		return nil
 	}
 
-	// Build pod IP to Pod mapping
+	var allPodsInfo []PodInfo
 	for _, pod := range pods.Items {
-		if pod.Status.PodIP != "" {
-			k.podIPMap[pod.Status.PodIP] = pod
-		}
-	}
-
-	infos := make([]PodInfo, 0, len(pods.Items))
-	for i := range pods.Items {
-		pod := pods.Items[i]
-		if pod.Status.PodIP == "" || pod.Status.Phase != v1.PodRunning {
+		// Skip pods without an IP (e.g., Pending state)
+		if pod.Status.PodIP == "" {
+			log.Printf("Skipping pod %s/%s: no IP address assigned (phase: %s)", pod.Namespace, pod.Name, pod.Status.Phase)
 			continue
 		}
 
-		var containerNames []string
-		var image string
+		// Collect container names
+		containerNames := make([]string, 0, len(pod.Spec.Containers))
+		for _, container := range pod.Spec.Containers {
+			containerNames = append(containerNames, container.Name)
+		}
+
+		// Get the primary container image (first container)
+		image := ""
 		if len(pod.Spec.Containers) > 0 {
-			image = pod.Spec.Containers[0].Image // TODO Not sure if this matters taking the first one for now
-			for _, c := range pod.Spec.Containers {
-				containerNames = append(containerNames, c.Name)
-			}
+			image = pod.Spec.Containers[0].Image
 		}
 
-		var ips []string
-		if pod.Status.HostIP != "" {
-			ips = []string{pod.Status.HostIP}
+		podInfo := PodInfo{
+			Name:       pod.Name,
+			Namespace:  pod.Namespace,
+			IPs:        []string{pod.Status.PodIP}, // Store as slice
+			Image:      image,
+			Containers: containerNames,
+			Pod:        &pod, // Store the full pod object for port discovery
 		}
-
-		if len(ips) > 0 {
-			infos = append(infos, PodInfo{
-				Name:       pod.Name,
-				Namespace:  pod.Namespace,
-				Image:      image,
-				IPs:        ips,
-				Containers: containerNames,
-				Pod:        &pod,
-			})
+		allPodsInfo = append(allPodsInfo, podInfo)
+	}
+	log.Printf("Found %d pods in the cluster (with IP addresses)", len(allPodsInfo))
+	
+	// Log summary of IP discovery
+	totalIPs := 0
+	uniqueIPs := make(map[string]bool)
+	for _, pod := range allPodsInfo {
+		for _, ip := range pod.IPs {
+			totalIPs++
+			uniqueIPs[ip] = true
 		}
 	}
-	return infos
+	log.Printf("IP discovery summary: %d total IPs across %d pods (%d unique IPs). Note: Multiple pods may share the same IP if using host networking mode.", totalIPs, len(allPodsInfo), len(uniqueIPs))
+	
+	return allPodsInfo
+}
+
+// executeInPod executes a command in a specific container of a pod
+func (k *K8sClient) executeInPod(namespace, podName, containerName string, command []string) (string, string, error) {
+	req := k.clientset.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Name(podName).
+		Namespace(namespace).
+		SubResource("exec")
+
+	req.VersionedParams(&v1.PodExecOptions{
+		Container: containerName,
+		Command:   command,
+		Stdin:     false,
+		Stdout:    true,
+		Stderr:    true,
+		TTY:       false,
+	}, scheme.ParameterCodec)
+
+	log.Printf("Executing command in pod %s/%s: %v", namespace, podName, command)
+
+	exec, err := remotecommand.NewSPDYExecutor(k.restCfg, "POST", req.URL())
+	if err != nil {
+		return "", "", fmt.Errorf("failed to create executor: %w", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	err = exec.StreamWithContext(context.TODO(), remotecommand.StreamOptions{
+		Stdout: &stdout,
+		Stderr: &stderr,
+	})
+
+	if err != nil {
+		return stdout.String(), stderr.String(), fmt.Errorf("command execution failed: %w", err)
+	}
+
+	log.Printf("Command in pod %s/%s executed successfully", namespace, podName)
+	return stdout.String(), stderr.String(), nil
+}
+
+func (k *K8sClient) getIngressController() (*unstructured.Unstructured, error) {
+	log.Println("Attempting to get IngressController custom resource...")
+	ingressController, err := k.clientset.DynamicClient().Resource(schema.GroupVersionResource{
+		Group:    "operator.openshift.io",
+		Version:  "v1",
+		Resource: "ingresscontrollers",
+	}).Namespace("openshift-ingress-operator").Get(context.TODO(), "default", metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get IngressController custom resource: %w", err)
+	}
+
+	log.Println("Successfully retrieved IngressController custom resource")
+	return ingressController, nil
+}
+
+func (k *K8sClient) getKubeletConfigWithTLSProfile() (*unstructured.Unstructured, error) {
+	log.Println("Searching for KubeletConfig with TLSSecurityProfile...")
+	list, err := k.clientset.DynamicClient().Resource(schema.GroupVersionResource{
+		Group:    "machineconfiguration.openshift.io",
+		Version:  "v1",
+		Resource: "kubeletconfigs",
+	}).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list KubeletConfig resources: %w", err)
+	}
+
+	for _, item := range list.Items {
+		if _, found, _ := unstructured.NestedMap(item.Object, "spec", "tlsSecurityProfile"); found {
+			log.Printf("Found KubeletConfig '%s' with TLSSecurityProfile", item.GetName())
+			return &item, nil
+		}
+	}
+
+	log.Println("No KubeletConfig with a TLSSecurityProfile found in the cluster")
+	return nil, nil // Not an error, just means none was found
 }
