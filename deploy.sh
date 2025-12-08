@@ -74,9 +74,23 @@ push_image() {
     print_header "Step 2: Pushing Container Image"
     check_command "podman" || check_command "docker"
 
+    if [ "$LOCAL_MODE" = true ]; then
+        echo "--> Local mode: Ensuring access to internal registry..."
+        REGISTRY_HOST=$(echo "$SCANNER_IMAGE" | cut -d/ -f1)
+        if [[ "$REGISTRY_HOST" == *"openshift-image-registry"* ]]; then
+             if command -v podman &> /dev/null; then
+                 # For podman, we might need to login.
+                 # Check if we are already logged in or try to login
+                 echo "--> Logging into internal registry: $REGISTRY_HOST"
+                 oc registry login --registry="$REGISTRY_HOST" --auth-basic=user:$(oc whoami -t) --to=/dev/null || \
+                 podman login -u user -p $(oc whoami -t) --tls-verify=false "$REGISTRY_HOST"
+             fi
+        fi
+    fi
+
     echo "--> Pushing container image: ${SCANNER_IMAGE}"
     if command -v podman &> /dev/null; then
-        podman push ${SCANNER_IMAGE}
+        podman push ${SCANNER_IMAGE} --tls-verify=false
         check_error "Podman push"
     elif command -v docker &> /dev/null; then
         docker push ${SCANNER_IMAGE}
@@ -142,10 +156,10 @@ EOF
     check_error "Binding tls-scanner-cross-namespace ClusterRole"
 
     echo "--> Copying global pull secret to allow image pulls from CI registry..."
+    oc delete secret pull-secret -n "$NAMESPACE" --ignore-not-found=true
     oc get secret pull-secret -n openshift-config -o yaml | sed "s/namespace: .*/namespace: $NAMESPACE/" | oc apply -n "$NAMESPACE" -f -
     check_error "Copying pull secret"
-    oc secrets link default pull-secret --for=pull -n "$NAMESPACE"
-    check_error "Linking pull secret"
+    oc secrets link default pull-secret --for=pull -n "$NAMESPACE" 2>/dev/null || echo "    (pull-secret already linked to default SA)"
 
     echo "--> Applying Job manifest from template: ${JOB_TEMPLATE}"
     if [ ! -f "$JOB_TEMPLATE" ]; then
@@ -302,6 +316,16 @@ while [[ $# -gt 0 ]]; do
 done
 
 set -- "${POSITIONAL_ARGS[@]}" # restore positional parameters
+
+# Adjust SCANNER_IMAGE for local mode if not explicitly set to something else
+if [ "$LOCAL_MODE" = true ]; then
+    # Only override if the user didn't set a custom SCANNER_IMAGE, or if it's the default value
+    if [ "$SCANNER_IMAGE" = "quay.io/user/tls-scanner:latest" ]; then
+        REGISTRY_HOST=$(oc registry info 2>/dev/null || echo "default-route-openshift-image-registry.apps-crc.testing")
+        SCANNER_IMAGE="${REGISTRY_HOST}/${NAMESPACE}/${APP_NAME}:latest"
+        echo "--> Local mode detected. Switching image to internal registry: ${SCANNER_IMAGE}"
+    fi
+fi
 
 ACTION=$1
 
