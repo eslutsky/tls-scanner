@@ -15,7 +15,8 @@ spec:
         args:
           - |
             # Run the scanner in the background and capture its exit code
-            /usr/local/bin/tls-scanner --all-pods --json-file /artifacts/results.json --csv-file /artifacts/results.csv --log-file /artifacts/scan.log ${NAMESPACE_FILTER_ARG} --limit-ips 10 &
+            /usr/local/bin/tls-scanner --all-pods --json-file /artifacts/results.json --csv-file /artifacts/results.csv --log-file /artifacts/scan.log ${NAMESPACE_FILTER_ARG} &
+            
             SCANNER_PID=$!
             
             # Stream the log file in real-time to stdout (--retry waits for file creation)
@@ -36,9 +37,9 @@ spec:
             echo "Scanner finished with exit code: $exit_code"
             echo "=========================================="
             
-            # Keep the container alive briefly to ensure logs are scraped
-            echo "Pausing for log collection..."
-            sleep 120
+            # Keep the container alive to allow artifact collection
+            echo "Pausing for log and artifact collection..."
+            sleep 300
             exit $exit_code
         resources:
           requests:

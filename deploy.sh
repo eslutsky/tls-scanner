@@ -233,42 +233,72 @@ EOF
     fi
 
     echo "--> To monitor logs, run: oc logs -f job/${JOB_NAME} -n ${NAMESPACE}"
-    echo "--> Waiting for job to complete... (timeout: 3h)"
+    echo "--> Waiting for scanner to finish... (timeout: 3h)"
 
-    # Wait for the job to complete
+    # Find the pod created by the job
+    POD_NAME=$(oc get pods -n "${NAMESPACE}" -l job-name=${JOB_NAME} -o jsonpath='{.items[0].metadata.name}')
+    
+    # Monitor logs and wait for the scanner to finish (but NOT for the pod to complete)
+    # The scanner prints "Scanner finished with exit code:" when done
+    START_TIME=$(date +%s)
+    TIMEOUT=10800  # 3 hours in seconds
+    SCANNER_FINISHED=false
+    
+    while true; do
+        CURRENT_TIME=$(date +%s)
+        ELAPSED=$((CURRENT_TIME - START_TIME))
+        
+        if [ $ELAPSED -gt $TIMEOUT ]; then
+            echo "Error: Scanner did not complete within 3h timeout."
+            exit 1
+        fi
+        
+        # Check if scanner has finished by looking for the completion message in logs
+        if oc logs "pod/${POD_NAME}" -n "${NAMESPACE}" 2>/dev/null | grep -q "Scanner finished with exit code:"; then
+            SCANNER_FINISHED=true
+            echo "--> Scanner has finished. Copying artifacts while pod is still alive..."
+            break
+        fi
+        
+        # Check if pod failed
+        POD_STATUS=$(oc get pod "${POD_NAME}" -n "${NAMESPACE}" -o jsonpath='{.status.phase}' 2>/dev/null)
+        if [ "$POD_STATUS" = "Failed" ]; then
+            echo "Error: Scanner pod failed."
+            oc logs "pod/${POD_NAME}" -n "${NAMESPACE}"
+            exit 1
+        fi
+        
+        sleep 5
+    done
+    
+    # Copy artifacts while the pod is still running (during the 120-second sleep window)
+    if [ "$SCANNER_FINISHED" = "true" ]; then
+        echo "--> Copying artifacts from running pod..."
+        mkdir -p ./artifacts
+        
+        # Give the scanner a moment to flush all files
+        sleep 3
+        
+        # Copy files from the pod
+        oc cp "${NAMESPACE}/${POD_NAME}:/artifacts/results.json" "./artifacts/results.json" 2>/dev/null || echo "Warning: Could not copy results.json"
+        oc cp "${NAMESPACE}/${POD_NAME}:/artifacts/results.csv" "./artifacts/results.csv" 2>/dev/null || echo "Warning: Could not copy results.csv"
+        oc cp "${NAMESPACE}/${POD_NAME}:/artifacts/scan.log" "./artifacts/scan.log" 2>/dev/null || echo "Warning: Could not copy scan.log"
+        
+        echo "--> Artifacts copied to ./artifacts directory."
+        echo "--> Listing artifacts:"
+        ls -lh ./artifacts/
+    fi
+    
+    # Now wait for the job to complete
+    echo "--> Waiting for job to complete... (timeout: 3h)"
     if ! oc wait --for=condition=complete "job/${JOB_NAME}" -n "${NAMESPACE}" --timeout=3h; then
         echo "Error: Job '${JOB_NAME}' did not complete within the 3h timeout."
         echo "--- Final job status ---"
         oc describe job "${JOB_NAME}" -n "${NAMESPACE}"
-        echo "--- Final pod status ---"
-        POD_NAME=$(oc get pods -n "${NAMESPACE}" -l job-name=${JOB_NAME} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-        if [ -n "$POD_NAME" ]; then
-            oc describe pod "${POD_NAME}" -n "${NAMESPACE}"
-            echo "--- Scanner pod logs ---"
-            oc logs "pod/${POD_NAME}" -n "${NAMESPACE}"
-        fi
         exit 1
     fi
-
-    echo "--> Job '${JOB_NAME}' completed successfully."
     
-    echo "--> Copying artifacts from completed pod..."
-    # Find the pod created by the job
-    POD_NAME=$(oc get pods -n "${NAMESPACE}" -l job-name=${JOB_NAME} -o jsonpath='{.items[0].metadata.name}')
-    check_error "Finding completed pod"
-
-    # Create a local directory for artifacts
-    mkdir -p ./artifacts
-
-    # Copy files from the pod
-    oc cp "${NAMESPACE}/${POD_NAME}:/artifacts/results.json" "./artifacts/results.json"
-    check_error "Copying results.json"
-    oc cp "${NAMESPACE}/${POD_NAME}:/artifacts/results.csv" "./artifacts/results.csv"
-    check_error "Copying results.csv"
-    oc cp "${NAMESPACE}/${POD_NAME}:/artifacts/scan.log" "./artifacts/scan.log"
-    check_error "Copying scan.log"
-
-    echo "--> Artifacts copied to ./artifacts directory."
+    echo "--> Job '${JOB_NAME}' completed successfully."
 }
 
 cleanup() {
