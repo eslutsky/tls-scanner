@@ -127,6 +127,70 @@ This performs:
 
 ---
 
+## 🧪 Testing TLS Configuration Detection
+
+To validate the scanner correctly detects TLS configuration changes on the API Server:
+
+### Run TLS Config Test
+```bash
+./deploy.sh --local test-tls-config
+```
+
+### What This Test Does
+
+1. **Saves** current API Server TLS configuration
+2. **Applies** restrictive TLS 1.3 config with single cipher (TLS_AES_128_GCM_SHA256)
+3. **Waits** for cluster to stabilize (~10 minutes by default)
+4. **Runs** scanner against API server pods (openshift-kube-apiserver, openshift-apiserver)
+5. **Verifies** scan detects ONLY TLS 1.3 and the configured cipher
+6. **Restores** original configuration
+7. **Reports** pass/fail with detailed results
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TLS_TEST_TIMEOUT` | 600 | Timeout in seconds for cluster stabilization |
+
+### Example Usage
+
+```bash
+# Run with default timeout (10 minutes)
+./deploy.sh --local test-tls-config
+
+# Run with custom timeout (15 minutes)
+TLS_TEST_TIMEOUT=900 ./deploy.sh --local test-tls-config
+```
+
+### Test Results
+
+Results are saved to `./tls-test-results/custom-tls-scan/`:
+- `results.json` - Full JSON scan results
+- `results.csv` - CSV format results
+- `scan.log` - Detailed scan logs
+
+### What PASS Means
+
+The test passes when the scanner correctly detects:
+- **TLS Version**: TLSv1.3 (and ONLY TLSv1.3)
+- **Cipher**: TLS_AES_128_GCM_SHA256 (or nmap equivalent naming)
+
+### What FAIL Means
+
+The test fails if:
+- Additional TLS versions are detected (e.g., TLSv1.2)
+- Additional ciphers are detected
+- No TLS information is detected at all
+- The cluster doesn't stabilize within the timeout
+
+### Important Notes
+
+- This test **modifies live cluster configuration** and requires cluster-admin privileges
+- The test includes automatic restoration of original config on failure or interruption
+- Use `Ctrl+C` to abort - original config will still be restored
+
+---
+
 ## 📊 Viewing Nmap Scan Results
 
 ### Option 1: Pod Logs (Real-time, Always Available)

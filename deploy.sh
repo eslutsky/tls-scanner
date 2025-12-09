@@ -1,14 +1,18 @@
 #!/bin/bash
 # A script to build, deploy, and run the OpenShift scanner application.
 #
-# Usage: ./deploy.sh [action]
+# Usage: ./deploy.sh [--local] [action]
 # Actions:
-#   build          - Build the container image.
-#   push           - Push the container image to a registry.
-#   deploy         - Deploy the scanner as a Kubernetes Job.
-#   cleanup        - Remove all scanner-related resources.
-#   full-deploy    - Run build, push, and deploy actions.
-#   (no action)    - Run a full-deploy and then cleanup.
+#   build           - Build the container image.
+#   push            - Push the container image to a registry.
+#   deploy          - Deploy the scanner as a Kubernetes Job.
+#   cleanup         - Remove all scanner-related resources.
+#   full-deploy     - Run build, push, and deploy actions.
+#   test-tls-config - Test scanner by changing API Server TLS config and validating detection.
+#   (no action)     - Run a full-deploy and then cleanup.
+#
+# Environment Variables:
+#   TLS_TEST_TIMEOUT - Timeout in seconds for cluster stabilization during TLS tests (default: 600)
 
 # --- Configuration ---
 APP_NAME="tls-scanner"
@@ -18,6 +22,10 @@ SCANNER_IMAGE=${SCANNER_IMAGE:-"quay.io/user/tls-scanner:latest"}
 NAMESPACE=${NAMESPACE:-$(oc project -q)}
 JOB_TEMPLATE="scanner-job.yaml.template"
 JOB_NAME="tls-scanner-job"
+
+# TLS test configuration
+TLS_TEST_TIMEOUT=${TLS_TEST_TIMEOUT:-600}  # 10 minutes default, configurable
+TLS_TEST_RESULTS_DIR="./tls-test-results"
 
 # --- Functions ---
 
@@ -301,6 +309,363 @@ EOF
     echo "--> Job '${JOB_NAME}' completed successfully."
 }
 
+# --- TLS Test Helper Functions ---
+
+# Wait for API server pods to be stable after TLS configuration changes
+wait_for_api_server_stable() {
+    local timeout=${1:-$TLS_TEST_TIMEOUT}
+    local start_time=$(date +%s)
+    local poll_interval=30
+    
+    echo "--> Waiting for API server to stabilize (timeout: ${timeout}s)..."
+    
+    while true; do
+        local current_time=$(date +%s)
+        local elapsed=$((current_time - start_time))
+        
+        if [ $elapsed -gt $timeout ]; then
+            echo "Error: API server did not stabilize within ${timeout}s timeout."
+            return 1
+        fi
+        
+        # First, check if we can connect to the API at all
+        if ! oc get nodes &>/dev/null; then
+            echo "    API server not responding yet. Elapsed: ${elapsed}s. Waiting..."
+            sleep $poll_interval
+            continue
+        fi
+        
+        # Check kube-apiserver pods in openshift-kube-apiserver namespace
+        local kube_api_ready=$(oc get pods -n openshift-kube-apiserver -l app=openshift-kube-apiserver -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null | tr ' ' '\n' | grep -c "True" || echo "0")
+        local kube_api_total=$(oc get pods -n openshift-kube-apiserver -l app=openshift-kube-apiserver --no-headers 2>/dev/null | wc -l || echo "0")
+        
+        # Check openshift-apiserver pods
+        local ocp_api_ready=$(oc get pods -n openshift-apiserver -l app=openshift-apiserver -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null | tr ' ' '\n' | grep -c "True" || echo "0")
+        local ocp_api_total=$(oc get pods -n openshift-apiserver -l app=openshift-apiserver --no-headers 2>/dev/null | wc -l || echo "0")
+        
+        echo "    API server status: kube-apiserver ${kube_api_ready}/${kube_api_total} ready, openshift-apiserver ${ocp_api_ready}/${ocp_api_total} ready. Elapsed: ${elapsed}s"
+        
+        # Consider stable if at least one pod is ready in each namespace
+        if [ "$kube_api_ready" -gt 0 ] && [ "$ocp_api_ready" -gt 0 ]; then
+            # Additional check: verify API server is responding properly
+            if oc get apiserver cluster &>/dev/null; then
+                echo "--> API server is stable and responding."
+                return 0
+            fi
+        fi
+        
+        sleep $poll_interval
+    done
+}
+
+# Get current API server TLS configuration and save to file
+get_current_apiserver_tls_config() {
+    local output_file="${1:-/tmp/apiserver-tls-config-backup.json}"
+    
+    echo "--> Saving current API Server TLS configuration to ${output_file}..."
+    
+    # Get the current tlsSecurityProfile spec
+    local tls_config=$(oc get apiserver cluster -o jsonpath='{.spec.tlsSecurityProfile}' 2>/dev/null)
+    
+    if [ -z "$tls_config" ] || [ "$tls_config" = "null" ]; then
+        echo "null" > "$output_file"
+        echo "    Current config: Default (no custom TLS profile set)"
+    else
+        echo "$tls_config" > "$output_file"
+        echo "    Current config saved: $tls_config"
+    fi
+    
+    echo "$output_file"
+}
+
+# Set API server TLS configuration
+set_apiserver_tls_config() {
+    local config="$1"
+    
+    echo "--> Applying API Server TLS configuration..."
+    echo "    Config: $config"
+    
+    if [ "$config" = "null" ] || [ -z "$config" ]; then
+        # Remove the TLS security profile to restore default
+        oc patch apiserver cluster --type=json -p='[{"op": "remove", "path": "/spec/tlsSecurityProfile"}]' 2>/dev/null || \
+        oc patch apiserver cluster --type=merge -p '{"spec":{"tlsSecurityProfile":null}}'
+    else
+        # Apply the specified TLS configuration
+        oc patch apiserver cluster --type=merge -p "{\"spec\":{\"tlsSecurityProfile\":$config}}"
+    fi
+    
+    if [ $? -eq 0 ]; then
+        echo "    TLS configuration applied successfully."
+        return 0
+    else
+        echo "Error: Failed to apply TLS configuration."
+        return 1
+    fi
+}
+
+# Verify scan results contain only expected TLS version and cipher
+verify_scan_results() {
+    local results_file="$1"
+    local expected_version="TLSv1.3"
+    local expected_cipher="TLS_AES_128_GCM_SHA256"
+    
+    echo "--> Verifying scan results from ${results_file}..."
+    
+    if [ ! -f "$results_file" ]; then
+        echo "Error: Results file not found: $results_file"
+        return 1
+    fi
+    
+    # Check if jq is available
+    if ! command -v jq &>/dev/null; then
+        echo "Error: jq is required for result verification but not found."
+        return 1
+    fi
+    
+    local validation_passed=true
+    local error_messages=""
+    
+    # Extract all TLS versions and ciphers from API server related scans
+    # Look at all port results that have TLS information
+    local tls_data=$(jq -r '
+        .ip_results[]? | 
+        select(.port_results != null) | 
+        .port_results[]? | 
+        select(.tls_versions != null and (.tls_versions | length) > 0) |
+        {versions: .tls_versions, ciphers: .tls_ciphers}
+    ' "$results_file" 2>/dev/null)
+    
+    if [ -z "$tls_data" ]; then
+        echo "Warning: No TLS data found in scan results."
+        echo "    This may indicate the scan did not detect any TLS-enabled services."
+        # Check if there are any results at all
+        local total_ips=$(jq -r '.scanned_ips // 0' "$results_file" 2>/dev/null)
+        echo "    Total IPs scanned: $total_ips"
+        return 1
+    fi
+    
+    echo "    Found TLS data in scan results. Validating..."
+    
+    # Check TLS versions - should only contain TLSv1.3
+    local versions=$(jq -r '
+        [.ip_results[]?.port_results[]? | 
+         select(.tls_versions != null) | 
+         .tls_versions[]?] | unique | .[]
+    ' "$results_file" 2>/dev/null)
+    
+    echo "    Detected TLS versions: $versions"
+    
+    # Validate versions
+    local version_count=0
+    local invalid_versions=""
+    while IFS= read -r version; do
+        [ -z "$version" ] && continue
+        version_count=$((version_count + 1))
+        if [ "$version" != "$expected_version" ]; then
+            invalid_versions="$invalid_versions $version"
+            validation_passed=false
+        fi
+    done <<< "$versions"
+    
+    if [ -n "$invalid_versions" ]; then
+        error_messages="${error_messages}Unexpected TLS versions found:${invalid_versions}\n"
+    fi
+    
+    if [ $version_count -eq 0 ]; then
+        echo "Warning: No TLS versions detected in results."
+        validation_passed=false
+        error_messages="${error_messages}No TLS versions detected.\n"
+    elif echo "$versions" | grep -q "$expected_version"; then
+        echo "    [PASS] Expected TLS version '$expected_version' detected."
+    else
+        echo "    [FAIL] Expected TLS version '$expected_version' NOT detected."
+        validation_passed=false
+    fi
+    
+    # Check ciphers - should only contain TLS_AES_128_GCM_SHA256
+    # Note: nmap may report it as TLS_AKE_WITH_AES_128_GCM_SHA256 for TLS 1.3
+    local ciphers=$(jq -r '
+        [.ip_results[]?.port_results[]? | 
+         select(.tls_ciphers != null) | 
+         .tls_ciphers[]?] | unique | .[]
+    ' "$results_file" 2>/dev/null)
+    
+    echo "    Detected ciphers: $ciphers"
+    
+    # Validate ciphers - accept both IANA and nmap naming conventions
+    local cipher_count=0
+    local invalid_ciphers=""
+    local valid_cipher_found=false
+    while IFS= read -r cipher; do
+        [ -z "$cipher" ] && continue
+        cipher_count=$((cipher_count + 1))
+        # Accept variations of the expected cipher name
+        if [[ "$cipher" == *"AES_128_GCM_SHA256"* ]] || [[ "$cipher" == "$expected_cipher" ]]; then
+            valid_cipher_found=true
+        else
+            invalid_ciphers="$invalid_ciphers $cipher"
+            validation_passed=false
+        fi
+    done <<< "$ciphers"
+    
+    if [ -n "$invalid_ciphers" ]; then
+        error_messages="${error_messages}Unexpected ciphers found:${invalid_ciphers}\n"
+    fi
+    
+    if [ $cipher_count -eq 0 ]; then
+        echo "Warning: No ciphers detected in results."
+        validation_passed=false
+        error_messages="${error_messages}No ciphers detected.\n"
+    elif [ "$valid_cipher_found" = true ]; then
+        echo "    [PASS] Expected cipher (containing 'AES_128_GCM_SHA256') detected."
+    else
+        echo "    [FAIL] Expected cipher NOT detected."
+        validation_passed=false
+    fi
+    
+    # Print summary
+    echo ""
+    if [ "$validation_passed" = true ]; then
+        echo "==> VALIDATION PASSED: Scan correctly detected TLS 1.3 with AES_128_GCM_SHA256 cipher."
+        return 0
+    else
+        echo "==> VALIDATION FAILED:"
+        echo -e "$error_messages"
+        return 1
+    fi
+}
+
+# Main TLS configuration test function
+test_tls_configuration() {
+    print_header "TLS Configuration Test"
+    
+    # Check prerequisites
+    check_command "oc"
+    check_command "jq"
+    
+    echo "--> Test configuration:"
+    echo "    Timeout: ${TLS_TEST_TIMEOUT}s"
+    echo "    Results directory: ${TLS_TEST_RESULTS_DIR}"
+    echo ""
+    
+    # Create results directory
+    mkdir -p "${TLS_TEST_RESULTS_DIR}"
+    
+    # Save original configuration
+    local original_config_file="${TLS_TEST_RESULTS_DIR}/original-tls-config.json"
+    get_current_apiserver_tls_config "$original_config_file"
+    local original_config=$(cat "$original_config_file")
+    
+    # Set up trap to restore configuration on exit/error
+    trap 'echo ""; echo "==> Restoring original TLS configuration due to interruption..."; set_apiserver_tls_config "$original_config"; wait_for_api_server_stable || true; exit 1' INT TERM
+    
+    local test_passed=false
+    
+    # Build and push the scanner image first
+    echo ""
+    print_header "Phase 0: Building Scanner Image"
+    build_image
+    push_image
+    
+    # Phase 1: Apply custom TLS configuration
+    echo ""
+    print_header "Phase 1: Custom TLS Configuration Test"
+    
+    # Define custom TLS config: TLS 1.3 only with single cipher
+    local custom_config='{"type":"Custom","custom":{"ciphers":["TLS_AES_128_GCM_SHA256"],"minTLSVersion":"VersionTLS13"}}'
+    
+    echo "--> Applying custom TLS 1.3 configuration..."
+    echo "    Cipher: TLS_AES_128_GCM_SHA256"
+    echo "    Min TLS Version: TLS 1.3"
+    
+    if ! set_apiserver_tls_config "$custom_config"; then
+        echo "Error: Failed to apply custom TLS configuration."
+        set_apiserver_tls_config "$original_config"
+        exit 1
+    fi
+    
+    echo ""
+    echo "--> Waiting for API server to restart with new TLS configuration..."
+    if ! wait_for_api_server_stable "$TLS_TEST_TIMEOUT"; then
+        echo "Error: API server did not stabilize after TLS configuration change."
+        echo "--> Restoring original configuration..."
+        set_apiserver_tls_config "$original_config"
+        wait_for_api_server_stable || true
+        exit 1
+    fi
+    
+    # Run the scanner targeting API server namespaces
+    echo ""
+    echo "--> Running scanner to detect TLS configuration..."
+    
+    # Set namespace filter for API server namespaces
+    NAMESPACE_FILTER="openshift-kube-apiserver,openshift-apiserver"
+    
+    # Deploy and run the scanner
+    deploy_scanner_job
+    
+    # Copy results to test results directory
+    echo "--> Copying scan results to ${TLS_TEST_RESULTS_DIR}/custom-tls-scan/..."
+    mkdir -p "${TLS_TEST_RESULTS_DIR}/custom-tls-scan"
+    cp -r ./artifacts/* "${TLS_TEST_RESULTS_DIR}/custom-tls-scan/" 2>/dev/null || true
+    
+    # Verify the scan results
+    echo ""
+    print_header "Phase 2: Validating Scan Results"
+    
+    if verify_scan_results "${TLS_TEST_RESULTS_DIR}/custom-tls-scan/results.json"; then
+        test_passed=true
+    else
+        test_passed=false
+    fi
+    
+    # Phase 3: Restore original configuration
+    echo ""
+    print_header "Phase 3: Restoring Original Configuration"
+    
+    echo "--> Restoring original TLS configuration..."
+    if ! set_apiserver_tls_config "$original_config"; then
+        echo "Warning: Failed to restore original TLS configuration."
+        echo "    You may need to manually restore the configuration."
+    fi
+    
+    echo "--> Waiting for API server to stabilize..."
+    wait_for_api_server_stable || echo "Warning: API server may not have fully stabilized."
+    
+    # Clean up the scanner job
+    echo "--> Cleaning up scanner job..."
+    oc delete job "$JOB_NAME" -n "$NAMESPACE" --ignore-not-found=true
+    
+    # Remove trap
+    trap - INT TERM
+    
+    # Print final summary
+    echo ""
+    print_header "Test Summary"
+    
+    echo "Results saved to: ${TLS_TEST_RESULTS_DIR}/custom-tls-scan/"
+    echo ""
+    
+    if [ "$test_passed" = true ]; then
+        echo "========================================"
+        echo "==>  TLS CONFIGURATION TEST: PASSED  <=="
+        echo "========================================"
+        echo ""
+        echo "The scanner correctly detected:"
+        echo "  - TLS version: TLSv1.3"
+        echo "  - Cipher: TLS_AES_128_GCM_SHA256"
+        exit 0
+    else
+        echo "========================================"
+        echo "==>  TLS CONFIGURATION TEST: FAILED  <=="
+        echo "========================================"
+        echo ""
+        echo "The scanner did not detect the expected TLS configuration."
+        echo "Check the results in: ${TLS_TEST_RESULTS_DIR}/custom-tls-scan/"
+        exit 1
+    fi
+}
+
 cleanup() {
     print_header "Step 4: Cleaning Up"
     check_command "oc"
@@ -376,6 +741,9 @@ case "$ACTION" in
         build_image
         push_image
         deploy_scanner_job
+        ;;
+    test-tls-config)
+        test_tls_configuration
         ;;
     *)
         echo "No action specified, running full-deploy and cleanup."
