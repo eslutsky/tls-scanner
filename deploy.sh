@@ -406,8 +406,8 @@ set_apiserver_tls_config() {
 # Verify scan results contain only expected TLS version and cipher
 verify_scan_results() {
     local results_file="$1"
-    local expected_version="TLSv1.3"
-    local expected_cipher="TLS_AES_128_GCM_SHA256"
+    local expected_version="${2:-TLSv1.2}"
+    local expected_cipher="${3:-ECDHE-RSA-AES128-GCM-SHA256}"
     
     echo "--> Verifying scan results from ${results_file}..."
     
@@ -492,15 +492,18 @@ verify_scan_results() {
     
     echo "    Detected ciphers: $ciphers"
     
-    # Validate ciphers - accept both IANA and nmap naming conventions
+    # Validate ciphers - accept both IANA and OpenSSL naming conventions
     local cipher_count=0
     local invalid_ciphers=""
     local valid_cipher_found=false
     while IFS= read -r cipher; do
         [ -z "$cipher" ] && continue
         cipher_count=$((cipher_count + 1))
-        # Accept variations of the expected cipher name
-        if [[ "$cipher" == *"AES_128_GCM_SHA256"* ]] || [[ "$cipher" == "$expected_cipher" ]]; then
+        # Accept variations of the expected cipher name (IANA and OpenSSL formats)
+        # ECDHE-RSA-AES128-GCM-SHA256 = TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+        if [[ "$cipher" == *"$expected_cipher"* ]] || \
+           [[ "$cipher" == *"ECDHE"*"RSA"*"AES"*"128"*"GCM"* ]] || \
+           [[ "$cipher" == *"AES_128_GCM_SHA256"* ]]; then
             valid_cipher_found=true
         else
             invalid_ciphers="$invalid_ciphers $cipher"
@@ -546,6 +549,7 @@ test_tls_configuration() {
     echo "--> Test configuration:"
     echo "    Timeout: ${TLS_TEST_TIMEOUT}s"
     echo "    Results directory: ${TLS_TEST_RESULTS_DIR}"
+    echo "    Namespace filter: ${NAMESPACE_FILTER:-openshift-kube-apiserver,openshift-apiserver (default)}"
     echo ""
     
     # Create results directory
@@ -571,12 +575,14 @@ test_tls_configuration() {
     echo ""
     print_header "Phase 1: Custom TLS Configuration Test"
     
-    # Define custom TLS config: TLS 1.3 only with single cipher
-    local custom_config='{"type":"Custom","custom":{"ciphers":["TLS_AES_128_GCM_SHA256"],"minTLSVersion":"VersionTLS13"}}'
+    # Define custom TLS config: TLS 1.2 with restricted cipher set
+    # Note: TLS 1.3 ciphers are not configurable per TLS 1.3 spec, so we test with TLS 1.2
+    local custom_config='{"type":"Custom","custom":{"ciphers":["ECDHE-RSA-AES128-GCM-SHA256"],"minTLSVersion":"VersionTLS12"}}'
     
-    echo "--> Applying custom TLS 1.3 configuration..."
-    echo "    Cipher: TLS_AES_128_GCM_SHA256"
-    echo "    Min TLS Version: TLS 1.3"
+    echo "--> Applying custom TLS 1.2 configuration..."
+    echo "    Cipher: ECDHE-RSA-AES128-GCM-SHA256 (TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256)"
+    echo "    Min TLS Version: TLS 1.2"
+    echo "    Note: TLS 1.3 ciphers are not configurable per TLS 1.3 specification"
     
     if ! set_apiserver_tls_config "$custom_config"; then
         echo "Error: Failed to apply custom TLS configuration."
@@ -594,12 +600,17 @@ test_tls_configuration() {
         exit 1
     fi
     
-    # Run the scanner targeting API server namespaces
+    # Run the scanner targeting API server namespaces (or user-specified namespace)
     echo ""
     echo "--> Running scanner to detect TLS configuration..."
     
-    # Set namespace filter for API server namespaces
-    NAMESPACE_FILTER="openshift-kube-apiserver,openshift-apiserver"
+    # Use user-provided namespace filter, or default to API server namespaces
+    if [ -z "$NAMESPACE_FILTER" ]; then
+        NAMESPACE_FILTER="openshift-kube-apiserver,openshift-apiserver"
+        echo "    Using default namespace filter: ${NAMESPACE_FILTER}"
+    else
+        echo "    Using custom namespace filter: ${NAMESPACE_FILTER}"
+    fi
     
     # Deploy and run the scanner
     deploy_scanner_job
@@ -652,8 +663,8 @@ test_tls_configuration() {
         echo "========================================"
         echo ""
         echo "The scanner correctly detected:"
-        echo "  - TLS version: TLSv1.3"
-        echo "  - Cipher: TLS_AES_128_GCM_SHA256"
+        echo "  - TLS version: TLSv1.2"
+        echo "  - Cipher: ECDHE-RSA-AES128-GCM-SHA256"
         exit 0
     else
         echo "========================================"
