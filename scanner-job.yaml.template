@@ -43,11 +43,11 @@ spec:
             exit $exit_code
         resources:
           requests:
-            cpu: 100m
-            memory: 100Mi
+            cpu: 50m
+            memory: 64Mi
           limits:
             cpu: 500m
-            memory: 512Mi
+            memory: 256Mi
         securityContext:
           privileged: true
         volumeMounts:
