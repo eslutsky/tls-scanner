@@ -7,6 +7,7 @@ spec:
   template:
     spec:
       serviceAccountName: default # Uses the SA configured by the deploy script
+      priorityClassName: system-cluster-critical  # High priority to help with scheduling in saturated clusters
       containers:
       - name: tls-scanner
         image: ${SCANNER_IMAGE}
