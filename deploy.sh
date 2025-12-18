@@ -229,6 +229,19 @@ EOF
             if [ -n "$REASON" ]; then
                  echo "    Container waiting reason: ${REASON}. This may indicate an image pull or configuration issue."
             fi
+            
+            # Check if pod is scheduled but not starting (potential node/kubelet issue)
+            if [ $i -eq 30 ]; then  # After 5 minutes, check for node issues
+                POD_SCHEDULED=$(oc get pod "${POD_NAME}" -n "${NAMESPACE}" -o jsonpath='{.status.conditions[?(@.type=="PodScheduled")].status}' 2>/dev/null)
+                POD_NODE=$(oc get pod "${POD_NAME}" -n "${NAMESPACE}" -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+                if [ "$POD_SCHEDULED" = "True" ] && [ -n "$POD_NODE" ]; then
+                    echo "    WARNING: Pod scheduled to node $POD_NODE but not starting after 5min. Checking node and events..."
+                    oc get node "$POD_NODE" --no-headers 2>/dev/null | head -1 || echo "    Could not get node status"
+                    echo "    Recent events for pod:"
+                    oc get events -n "${NAMESPACE}" --field-selector involvedObject.name="${POD_NAME}" --sort-by='.lastTimestamp' 2>/dev/null | tail -5 || echo "    No events found"
+                fi
+            fi
+            
             sleep 10
         fi
     done
