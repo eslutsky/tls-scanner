@@ -22,7 +22,8 @@ This is the recommended approach for automated scanning in an ephemeral test env
 Set these environment variables in your CI job:
 
 - `SCANNER_IMAGE`: The full tag of the image to build and push (e.g., `quay.io/my-org/tls-scanner:latest`).
-- `NAMESPACE`: The OpenShift/Kubernetes namespace to run the scan in (e.g., `scanner-project`).
+- `NAMESPACE`: The OpenShift/Kubernetes namespace where the scanner Job will be deployed (e.g., `scanner-project`). **Note:** This does NOT restrict what gets scanned - it only determines where the scanner runs.
+- `NAMESPACE_FILTER`: (Optional) Comma-separated list of namespaces to scan. If not set, the scanner will scan all pods in the entire cluster. Example: `production,staging` to scan only those namespaces.
 - `KUBECONFIG`: Path to the kubeconfig file for the ephemeral test cluster.
 
 #### 2. Build and Push the Image
@@ -137,7 +138,7 @@ You can also run the steps manually.
 
 1.  **Build the image:** `export SCANNER_IMAGE="your-registry/image:tag"` and run `./deploy.sh build`.
 2.  **Push the image:** `./deploy.sh push`.
-3.  **Deploy the job:** `export NAMESPACE="your-namespace"` and run `./deploy.sh deploy`.
+3.  **Deploy the job:** `export NAMESPACE="scanner-project" NAMESPACE_FILTER="production"` and run `./deploy.sh deploy`
 4.  **Monitor and retrieve results** as shown in the CI workflow.
 5.  **Clean up** with `./deploy.sh cleanup`.
 
