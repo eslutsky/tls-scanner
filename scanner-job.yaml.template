@@ -11,7 +11,7 @@ spec:
       containers:
       - name: tls-scanner
         image: ${SCANNER_IMAGE}
-        imagePullPolicy: IfNotPresent
+        imagePullPolicy: Always
         command: ["/bin/sh", "-c"]
         args:
           - |
