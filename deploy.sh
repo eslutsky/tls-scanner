@@ -70,10 +70,10 @@ build_image() {
     fi
 
     if command -v podman &> /dev/null; then
-        podman build -t ${SCANNER_IMAGE} -f ${DOCKERFILE} .
+        podman build --platform linux/amd64,linux/arm64 -t ${SCANNER_IMAGE} -f ${DOCKERFILE} .
         check_error "Podman build"
     elif command -v docker &> /dev/null; then
-        docker build -t ${SCANNER_IMAGE} -f ${DOCKERFILE} .
+        docker build --platform linux/amd64,linux/arm64 -t ${SCANNER_IMAGE} -f ${DOCKERFILE} .
         check_error "Docker build"
     fi
     echo "--> Image built: ${SCANNER_IMAGE}"
