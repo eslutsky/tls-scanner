@@ -1,0 +1,69 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${JOB_NAME}
+  namespace: ${NAMESPACE}
+spec:
+  template:
+    spec:
+      hostNetwork: true
+      serviceAccountName: default # Uses the SA configured by the deploy script
+      priorityClassName: system-cluster-critical  # High priority to help with scheduling in saturated clusters
+      containers:
+      - name: tls-scanner
+        image: ${SCANNER_IMAGE}
+        imagePullPolicy: Always
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            
+            # Discover TCP open ports (we use hostNetwork)
+            TARGET_LIST=$(ss -lntp | awk '{print $4}' | cut -f2 -d: | grep -E '^[0-9]+$' | sed 's/^/localhost:/' | paste -sd,)
+            if [ -z "$TARGET_LIST" ]; then
+              echo "ERROR: No TCP listen ports found" >&2
+              exit 1
+            fi
+
+            echo "Generated Targets: $TARGET_LIST"
+     
+      
+            /usr/local/bin/tls-scanner --targets "$TARGET_LIST" --json-file /artifacts/results.json --csv-file /artifacts/results.csv --log-file /artifacts/scan.log  &
+            
+            SCANNER_PID=$!
+            
+            # Stream the log file in real-time to stdout (--retry waits for file creation)
+            tail -f --retry /artifacts/scan.log &
+            TAIL_PID=$!
+            
+            # Wait for the scanner to complete
+            wait $SCANNER_PID
+            exit_code=$?
+            
+            # Stop tailing and give it a moment to flush
+            kill $TAIL_PID 2>/dev/null || true
+            sleep 2
+            
+            # Dump any remaining log content to ensure nothing is missed
+            echo ""
+            echo "=========================================="
+            echo "Scanner finished with exit code: $exit_code"
+            echo "=========================================="
+            
+            exit $exit_code
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: artifacts
+          mountPath: /artifacts
+      restartPolicy: Never
+      volumes:
+      - name: artifacts
+        emptyDir: {}
+  backoffLimit: 2

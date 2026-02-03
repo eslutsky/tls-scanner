@@ -25,6 +25,8 @@ Set these environment variables in your CI job:
 - `NAMESPACE`: The OpenShift/Kubernetes namespace where the scanner Job will be deployed (e.g., `scanner-project`). **Note:** This does NOT restrict what gets scanned - it only determines where the scanner runs.
 - `NAMESPACE_FILTER`: (Optional) Comma-separated list of namespaces to scan. If not set, the scanner will scan all pods in the entire cluster. Example: `production,staging` to scan only those namespaces.
 - `KUBECONFIG`: Path to the kubeconfig file for the ephemeral test cluster.
+- `JOB_TEMPLATE_FILE`: (Optional) Path to the Job manifest template used by `deploy.sh deploy` (default: `scanner-job.yaml.template`). For host-based scanning, use a template that runs with host network access (e.g. `scanner-job-microshift.yaml.template`).
+- `SCAN_MODE`: (Optional) `pod` (default) or `host`. **Pod mode** discovers pods in the cluster and scans their TLS ports. **Host mode** is for environments where core components (API server, etcd, kubelet) run on the host rather than in pods—e.g. single-node or edge setups such as MicroShift. Use a job template with `hostNetwork: true` and set `SCAN_MODE=host` so the scanner runs on the host and can reach those services.
 
 #### 2. Build and Push the Image
 
@@ -65,6 +67,16 @@ kubectl cp "${NAMESPACE}/${POD_NAME}:/artifacts/." "./artifacts/"
 ```
 
 Your `./artifacts` directory will now contain `results.json`, `results.csv`, and `scan.log`.
+
+### Host-based scanning
+
+In some environments, core cluster components (API server, etcd, kubelet) run on the host instead of as pods. Examples include single-node and edge deployments such as MicroShift. For those setups, use **host** scan mode so the scanner runs with host network access and can discover and scan TLS services bound to the host:
+
+```bash
+JOB_TEMPLATE_FILE=scanner-job-microshift.yaml.template SCAN_MODE=host ./deploy.sh deploy
+```
+
+Use `JOB_TEMPLATE_FILE` to point at a job template that sets `spec.hostNetwork: true` (and any required security context). The default `scanner-job.yaml.template` is for pod-based scanning only.
 
 ## Understanding Scan Results
 

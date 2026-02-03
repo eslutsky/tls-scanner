@@ -20,7 +20,14 @@ APP_NAME="tls-scanner"
 SCANNER_IMAGE=${SCANNER_IMAGE:-"quay.io/user/tls-scanner:latest"}
 # Namespace to deploy to, can be overridden by NAMESPACE env var
 NAMESPACE=${NAMESPACE:-$(oc project -q)}
-JOB_TEMPLATE="scanner-job.yaml.template"
+
+# JOB_TEMPLATE specifies the YAML file containing the template for the tls-scanner job invocation
+JOB_TEMPLATE=${JOB_TEMPLATE_FILE:-"scanner-job.yaml.template"}
+
+# SCAN_MODE options:
+#   pod  - will query for the running pods' exposed TLS ports and scan them.
+#   host - will run as a privileged container on the host, scan all open TCP ports, and check their TLS configuration.
+SCAN_MODE=${SCAN_MODE:-"pod"}
 JOB_NAME="tls-scanner-job"
 LIMIT_IPS="${LIMIT_IPS:-0}"  # Limit number of IPs to scan (0 = no limit, useful for testing)
 
@@ -164,11 +171,18 @@ EOF
     oc adm policy add-cluster-role-to-user tls-scanner-cross-namespace -z default -n "$NAMESPACE"
     check_error "Binding tls-scanner-cross-namespace ClusterRole"
 
-    echo "--> Copying global pull secret to allow image pulls from CI registry..."
-    oc delete secret pull-secret -n "$NAMESPACE" --ignore-not-found=true
-    oc get secret pull-secret -n openshift-config -o yaml | sed "s/namespace: .*/namespace: $NAMESPACE/" | oc apply -n "$NAMESPACE" -f -
-    check_error "Copying pull secret"
-    oc secrets link default pull-secret --for=pull -n "$NAMESPACE" 2>/dev/null || echo "    (pull-secret already linked to default SA)"
+    # Only copy the global pull secret if this is NOT a MicroShift job (template doesn't contain 'microshift')
+    # In MicroShift, we do NOT need to provide the tls-scanner pod access to the API server,
+    # in MicroShift the tls-scanner scans the ports exposed by a binary that runs directly on the host, not inside containers.
+    # Therefore, it's safe to skip pull secret and cluster API access when using the MicroShift template.
+    if [[ "$SCAN_MODE" == "pod" ]]; then  
+
+        echo "--> Copying global pull secret to allow image pulls from CI registry..."
+        oc delete secret pull-secret -n "$NAMESPACE" --ignore-not-found=true
+        oc get secret pull-secret -n openshift-config -o yaml | sed "s/namespace: .*/namespace: $NAMESPACE/" | oc apply -n "$NAMESPACE" -f -
+        check_error "Copying pull secret"
+        oc secrets link default pull-secret --for=pull -n "$NAMESPACE" 2>/dev/null || echo "    (pull-secret already linked to default SA)"
+    fi
 
     echo "--> Applying Job manifest from template: ${JOB_TEMPLATE}"
     if [ ! -f "$JOB_TEMPLATE" ]; then
