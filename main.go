@@ -17,6 +17,17 @@ import (
 )
 
 func main() {
+	// Use a pointer to track scan results across all execution paths.
+	// Different scan scenarios are responsible for setting this variable
+	// with their results so that this deferred function can properly handle
+	// error codes.
+	var finalScanResults *ScanResults
+	defer func() {
+		if finalScanResults != nil && hasComplianceFailures(*finalScanResults) {
+			os.Exit(1)
+		}
+	}()
+
 	host := flag.String("host", "127.0.0.1", "The target host or IP address to scan")
 	port := flag.String("port", "443", "The target port to scan")
 	artifactDir := flag.String("artifact-dir", "/tmp", "Directory to save the artifacts to")
@@ -78,6 +89,7 @@ func main() {
 		}
 
 		scanResults := performTargetsScan(targetsByHost, *concurrentScans)
+		finalScanResults = &scanResults
 
 		// Create artifact directory if it doesn't exist
 		if *csvFile != "" || *jsonFile != "" || *junitFile != "" {
@@ -274,6 +286,8 @@ func main() {
 			printClusterResults(scanResults)
 		}
 
+		finalScanResults = &scanResults
+
 		return
 	}
 
@@ -291,6 +305,54 @@ func main() {
 		log.Fatalf("Error parsing Nmap XML output: %v", err)
 	}
 
+	// For single host scans, always create ScanResults for compliance checking
+	var tlsConfig *TLSSecurityProfile
+	if k8sClient != nil {
+		if config, err := k8sClient.getTLSSecurityProfile(); err != nil {
+			log.Printf("Warning: Could not collect TLS security profiles: %v", err)
+		} else {
+			tlsConfig = config
+		}
+	}
+
+	// Convert single scan to ScanResults format
+	singleResult := ScanResults{
+		Timestamp:         time.Now().Format(time.RFC3339),
+		TotalIPs:          1,
+		ScannedIPs:        1,
+		TLSSecurityConfig: tlsConfig,
+		IPResults: []IPResult{{
+			IP:          *host,
+			Status:      "scanned",
+			OpenPorts:   []int{}, // Will be extracted from nmapResult
+			PortResults: []PortResult{},
+		}},
+	}
+
+	// Extract port information from nmap result
+	if len(nmapResult.Hosts) > 0 && len(nmapResult.Hosts[0].Ports) > 0 {
+		for _, nmapPort := range nmapResult.Hosts[0].Ports {
+			if port, err := strconv.Atoi(nmapPort.PortID); err == nil {
+				singleResult.IPResults[0].OpenPorts = append(singleResult.IPResults[0].OpenPorts, port)
+				portResult := PortResult{
+					Port:     port,
+					Protocol: nmapPort.Protocol,
+					State:    nmapPort.State.State,
+					Service:  nmapPort.Service.Name,
+					NmapRun:  nmapResult,
+				}
+				portResult.TlsVersions, portResult.TlsCiphers, portResult.TlsCipherStrength = extractTLSInfo(portResult.NmapRun)
+
+				// Check compliance if TLS config is available
+				if tlsConfig != nil && len(portResult.TlsCiphers) > 0 {
+					checkCompliance(&portResult, tlsConfig)
+				}
+
+				singleResult.IPResults[0].PortResults = append(singleResult.IPResults[0].PortResults, portResult)
+			}
+		}
+	}
+
 	if *jsonFile != "" {
 		jsonPath := *jsonFile
 		if !filepath.IsAbs(jsonPath) {
@@ -306,45 +368,6 @@ func main() {
 		csvPath := *csvFile
 		if !filepath.IsAbs(csvPath) {
 			csvPath = filepath.Join(*artifactDir, *csvFile)
-		}
-		// For single host scans, try to get TLS config if k8s client is available
-		var tlsConfig *TLSSecurityProfile
-		if k8sClient != nil {
-			if config, err := k8sClient.getTLSSecurityProfile(); err != nil {
-				log.Printf("Warning: Could not collect TLS security profiles: %v", err)
-			} else {
-				tlsConfig = config
-			}
-		}
-
-		// Convert single scan to ScanResults format for CSV
-		singleResult := ScanResults{
-			Timestamp:         time.Now().Format(time.RFC3339),
-			TotalIPs:          1,
-			ScannedIPs:        1,
-			TLSSecurityConfig: tlsConfig,
-			IPResults: []IPResult{{
-				IP:          *host,
-				Status:      "scanned",
-				OpenPorts:   []int{}, // Will be extracted from nmapResult
-				PortResults: []PortResult{},
-			}},
-		}
-
-		// Extract port information from nmap result
-		if len(nmapResult.Hosts) > 0 && len(nmapResult.Hosts[0].Ports) > 0 {
-			for _, nmapPort := range nmapResult.Hosts[0].Ports {
-				if port, err := strconv.Atoi(nmapPort.PortID); err == nil {
-					singleResult.IPResults[0].OpenPorts = append(singleResult.IPResults[0].OpenPorts, port)
-					singleResult.IPResults[0].PortResults = append(singleResult.IPResults[0].PortResults, PortResult{
-						Port:     port,
-						Protocol: nmapPort.Protocol,
-						State:    nmapPort.State.State,
-						Service:  nmapPort.Service.Name,
-						NmapRun:  nmapResult,
-					})
-				}
-			}
 		}
 
 		if err := writeCSVOutput(singleResult, csvPath); err != nil {
@@ -366,6 +389,8 @@ func main() {
 	if *jsonFile == "" && *csvFile == "" {
 		printParsedResults(nmapResult)
 	}
+
+	finalScanResults = &singleResult
 }
 
 func writeJUnitOutput(scanResults ScanResults, filename string) error {
@@ -541,6 +566,30 @@ func checkCipherCompliance(gotCiphers []string, expectedCiphers []string) bool {
 	}
 
 	return true
+}
+
+// hasComplianceFailures checks if any port has TLS compliance violations
+func hasComplianceFailures(results ScanResults) bool {
+	for _, ipResult := range results.IPResults {
+		for _, portResult := range ipResult.PortResults {
+			// Check Ingress compliance
+			if portResult.IngressTLSConfigCompliance != nil &&
+				(!portResult.IngressTLSConfigCompliance.Version || !portResult.IngressTLSConfigCompliance.Ciphers) {
+				return true
+			}
+			// Check API Server compliance
+			if portResult.APIServerTLSConfigCompliance != nil &&
+				(!portResult.APIServerTLSConfigCompliance.Version || !portResult.APIServerTLSConfigCompliance.Ciphers) {
+				return true
+			}
+			// Check Kubelet compliance
+			if portResult.KubeletTLSConfigCompliance != nil &&
+				(!portResult.KubeletTLSConfigCompliance.Version || !portResult.KubeletTLSConfigCompliance.Ciphers) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // TODO move to helpers
