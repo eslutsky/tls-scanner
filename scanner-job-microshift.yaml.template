@@ -49,6 +49,9 @@ spec:
             echo "Scanner finished with exit code: $exit_code"
             echo "=========================================="
             
+            # Keep the container alive to allow artifact collection
+            echo "Pausing for log and artifact collection..."
+            sleep 300
             exit $exit_code
         resources:
           requests:

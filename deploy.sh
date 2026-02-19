@@ -319,12 +319,12 @@ EOF
         mkdir -p ./artifacts
         
         # Give the scanner a moment to flush all files
-        sleep 3
+        sleep 10
         
         # Copy files from the pod
-        oc cp "${NAMESPACE}/${POD_NAME}:/artifacts/results.json" "./artifacts/results.json" 2>/dev/null || echo "Warning: Could not copy results.json"
-        oc cp "${NAMESPACE}/${POD_NAME}:/artifacts/results.csv" "./artifacts/results.csv" 2>/dev/null || echo "Warning: Could not copy results.csv"
-        oc cp "${NAMESPACE}/${POD_NAME}:/artifacts/scan.log" "./artifacts/scan.log" 2>/dev/null || echo "Warning: Could not copy scan.log"
+        oc cp "${NAMESPACE}/${POD_NAME}:/artifacts/results.json" "./artifacts/results.json" 
+        oc cp "${NAMESPACE}/${POD_NAME}:/artifacts/results.csv" "./artifacts/results.csv" 
+        oc cp "${NAMESPACE}/${POD_NAME}:/artifacts/scan.log" "./artifacts/scan.log" 
         
         echo "--> Artifacts copied to ./artifacts directory."
         echo "--> Listing artifacts:"
