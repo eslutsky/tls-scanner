@@ -18,7 +18,7 @@ spec:
           - |
             
             # Discover TCP open ports (we use hostNetwork)
-            TARGET_LIST=$(ss -lntp | awk '{print $4}' | cut -f2 -d: | grep -E '^[0-9]+$' | sed 's/^/localhost:/' | paste -sd,)
+            TARGET_LIST=$(ss -lntp | awk '{print $4}' | cut -f2 -d: | grep -E '^[0-9]+$' | awk -F: '$1 > 2000 && $1 <= 30000' | sed 's/^/localhost:/' | paste -sd,)
             if [ -z "$TARGET_LIST" ]; then
               echo "ERROR: No TCP listen ports found" >&2
               exit 1
