@@ -51,7 +51,7 @@ spec:
             
             # Keep the container alive to allow artifact collection
             echo "Pausing for log and artifact collection..."
-            sleep 30
+            sleep 600
             exit $exit_code
         resources:
           requests:
