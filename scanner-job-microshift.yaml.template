@@ -17,8 +17,9 @@ spec:
         args:
           - |
             
-            # Discover TCP open ports (we use hostNetwork)
-            TARGET_LIST=$(ss -lntp | awk '{print $4}' | cut -f2 -d: | grep -E '^[0-9]+$' | sed 's/^/localhost:/' | paste -sd,)
+            # Discover TCP open ports from 2000-30000 (we use hostNetwork)
+            TARGET_LIST=$(ss -lntp | awk '{print $4}' | cut -f2 -d: | grep -E '^[0-9]+$' | awk -F: '$1 > 2000 && $1 <= 30000' | sed 's/^/localhost:/' | paste -sd,)
+
             if [ -z "$TARGET_LIST" ]; then
               echo "ERROR: No TCP listen ports found" >&2
               exit 1
@@ -48,8 +49,12 @@ spec:
             echo "=========================================="
             echo "Scanner finished with exit code: $exit_code"
             echo "=========================================="
-            
+
+            # Keep the container alive to allow artifact collection
+            echo "Pausing for log and artifact collection..."
+            sleep 30
             exit $exit_code
+            
         resources:
           requests:
             cpu: 50m
